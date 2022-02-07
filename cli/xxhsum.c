@@ -49,6 +49,7 @@
 #include <string.h>     /* strerror, strcmp, memcpy */
 #include <assert.h>     /* assert */
 #include <errno.h>      /* errno */
+#include <time.h>       /* clock_t, clock, CLOCKS_PER_SEC */
 
 #define XXH_STATIC_LINKING_ONLY   /* *_state_t */
 #include "../xxhash.h"
@@ -120,6 +121,21 @@ typedef union {
     XXH128_hash_t hash128;
 } Multihash;
 
+static int XSUM_FormatByteCount(XSUM_U64* Number, XSUM_U32* PastDec)
+{
+    int i = 0;
+    do
+    {
+        if (*Number < 1024)
+            break;
+        *PastDec = ((XSUM_U32)(*Number % 1024));
+        *Number = *Number / 1024;
+        i++;
+    }
+    while (i < 4);
+    return i;
+}
+
 /*
  * XSUM_hashStream:
  * Reads data from `inFile`, generating an incremental hash of type hashType,
@@ -128,20 +144,44 @@ typedef union {
 static Multihash
 XSUM_hashStream(FILE* inFile,
                 AlgoSelected hashType,
-                void* buffer, size_t blockSize)
+                void* buffer, size_t blockSize,
+                XSUM_U64 fileSize) // fileSize > 0 = Display progress
 {
+    XSUM_U64      processedBytes = 0; 
+    XSUM_U64      prevProcessedBytes = 0; 
     XXH32_state_t state32;
     XXH64_state_t state64;
     XXH3_state_t  state3;
-
+    
     /* Init */
     (void)XXH32_reset(&state32, XXHSUM32_DEFAULT_SEED);
     (void)XXH64_reset(&state64, XXHSUM64_DEFAULT_SEED);
     (void)XXH3_128bits_reset(&state3);
 
     /* Load file & update hash */
-    {   size_t readSize;
+    {   
+        size_t readSize;
+        clock_t clockStart;
+        const char* units[] = { "B", "KB", "MB", "GB" };
+        
+        int       fileSizePrintableUnit = 0;
+        XSUM_U64  fileSizePrintableU64 = fileSize;
+        XSUM_U32  fileSizePrintableU32 = 0;
+        
+        if (fileSize)
+        {
+            fileSizePrintableUnit = XSUM_FormatByteCount(&fileSizePrintableU64, &fileSizePrintableU32);
+            XSUM_log("\r # %lu.%u %s / %lu.%u %s #", 0lu, 0, "B", fileSizePrintableU64, fileSizePrintableU32, units[fileSizePrintableUnit]); // clear line
+            clockStart = clock();
+            while (clock() == clockStart);   /* starts clock() at its exact beginning */
+            clockStart = clock();
+        }
+        
         while ((readSize = fread(buffer, 1, blockSize, inFile)) > 0) {
+            if (fileSize)
+            {
+                processedBytes += readSize;
+            }
             switch(hashType)
             {
             case algo_xxh32:
@@ -159,6 +199,32 @@ XSUM_hashStream(FILE* inFile,
             default:
                 assert(0);
             }
+            const clock_t clockNow = clock();
+            const clock_t clockDelta = clockNow - clockStart;
+            if (fileSize && clockDelta > CLOCKS_PER_SEC)
+            {
+                const double TimeInSeconds = ((double)clockDelta) / CLOCKS_PER_SEC;
+                XSUM_U64 BytesDelta = processedBytes - prevProcessedBytes;
+                prevProcessedBytes = processedBytes;
+                clockStart = clockNow;
+                double BytesPerSecond = ((double)BytesDelta) / TimeInSeconds;
+                
+                XSUM_U64 PrintProcessedBytes = processedBytes;
+                XSUM_U32 PrintProcessedBytesDec = 0;
+                int PrintProcessedBytesUnit = XSUM_FormatByteCount(&PrintProcessedBytes, &PrintProcessedBytesDec);
+                
+                XSUM_U64 BytesPerSecU64 = ((XSUM_U64)BytesPerSecond);
+                XSUM_U32 BytesPerSecU32 = 0;
+                int BytesPerSecUnit = XSUM_FormatByteCount(&BytesPerSecU64, &BytesPerSecU32);
+                
+                XSUM_log("\r # %lu.%u %s / %lu.%u %s  ( %lu.%u %s/s ) #", PrintProcessedBytes, PrintProcessedBytesDec, units[PrintProcessedBytesUnit],
+                                                                          fileSizePrintableU64, fileSizePrintableU32, units[fileSizePrintableUnit],
+                                                                          BytesPerSecU64, BytesPerSecU32, units[BytesPerSecUnit]);
+            }
+        }
+        if (fileSize)
+        {
+            XSUM_log("                                                                            \r"); // clear line again when we're done
         }
         if (ferror(inFile)) {
             XSUM_log("Error: a failure occurred reading the input file.\n");
@@ -255,7 +321,8 @@ static XSUM_displayLine_f XSUM_kDisplayLine_fTable[2][2] = {
 static int XSUM_hashFile(const char* fileName,
                          const AlgoSelected hashType,
                          const Display_endianess displayEndianess,
-                         const Display_convention convention)
+                         const Display_convention convention,
+                         int PrintProgress)
 {
     size_t const blockSize = 64 KB;
     XSUM_displayLine_f const f_displayLine = XSUM_kDisplayLine_fTable[convention][displayEndianess];
@@ -263,6 +330,7 @@ static int XSUM_hashFile(const char* fileName,
     Multihash hashValue;
     assert(displayEndianess==big_endian || displayEndianess==little_endian);
     assert(convention==display_gnu || convention==display_bsd);
+    XSUM_U64 fileSize = 0;
 
     /* Check file existence */
     if (fileName == stdinName) {
@@ -278,7 +346,10 @@ static int XSUM_hashFile(const char* fileName,
         if (inFile==NULL) {
             XSUM_log("Error: Could not open '%s': %s. \n", fileName, strerror(errno));
             return 1;
-    }   }
+        }
+        if (PrintProgress > 0)
+            fileSize = XSUM_getFileSize(fileName);
+    }
 
     /* Memory allocation & streaming */
     {   void* const buffer = malloc(blockSize);
@@ -289,7 +360,7 @@ static int XSUM_hashFile(const char* fileName,
         }
 
         /* Stream file & update hash */
-        hashValue = XSUM_hashStream(inFile, hashType, buffer, blockSize);
+        hashValue = XSUM_hashStream(inFile, hashType, buffer, blockSize, fileSize);
 
         fclose(inFile);
         free(buffer);
@@ -337,16 +408,17 @@ static int XSUM_hashFile(const char* fileName,
 static int XSUM_hashFiles(const char* fnList[], int fnTotal,
                           AlgoSelected hashType,
                           Display_endianess displayEndianess,
-                          Display_convention convention)
+                          Display_convention convention,
+                          int PrintProgress)
 {
     int fnNb;
     int result = 0;
 
     if (fnTotal==0)
-        return XSUM_hashFile(stdinName, hashType, displayEndianess, convention);
+        return XSUM_hashFile(stdinName, hashType, displayEndianess, convention, PrintProgress);
 
     for (fnNb=0; fnNb<fnTotal; fnNb++)
-        result |= XSUM_hashFile(fnList[fnNb], hashType, displayEndianess, convention);
+        result |= XSUM_hashFile(fnList[fnNb], hashType, displayEndianess, convention, PrintProgress);
     XSUM_logVerbose(2, "\r%70s\r", "");
     return result;
 }
@@ -685,7 +757,7 @@ static void XSUM_parseFile1(ParseFileArg* XSUM_parseFileArg, int rev)
                 break;
             }
             lineStatus = LineStatus_hashFailed;
-            {   Multihash const xxh = XSUM_hashStream(fp, parsedLine.algo, XSUM_parseFileArg->blockBuf, XSUM_parseFileArg->blockSize);
+            {   Multihash const xxh = XSUM_hashStream(fp, parsedLine.algo, XSUM_parseFileArg->blockBuf, XSUM_parseFileArg->blockSize, 0);
                 switch (parsedLine.algo)
                 {
                 case algo_xxh32:
@@ -900,6 +972,7 @@ static int XSUM_usage_advanced(const char* exename)
     XSUM_log( "  -b#                  Bench only algorithm variant # \n");
     XSUM_log( "  -i#                  Number of times to run the benchmark (default: %i) \n", NBLOOPS_DEFAULT);
     XSUM_log( "  -q, --quiet          Don't display version header in benchmark mode \n");
+    XSUM_log( "  --progress           Report progress while working on big files \n");
     XSUM_log( "\n");
     XSUM_log( "The following four options are useful only when verifying checksums (-c): \n");
     XSUM_log( "  -q, --quiet          Don't print OK for each successfully verified file \n");
@@ -996,6 +1069,7 @@ XSUM_API int XSUM_main(int argc, const char* argv[])
     Display_endianess displayEndianess = big_endian;
     Display_convention convention = display_gnu;
     int nbIterations = NBLOOPS_DEFAULT;
+    int PrintProgress = 0;
 
     /* special case: xxhNNsum default to NN bits checksum */
     if (strstr(exename,  "xxh32sum") != NULL) algo = g_defaultAlgo = algo_xxh32;
@@ -1017,6 +1091,7 @@ XSUM_API int XSUM_main(int argc, const char* argv[])
         if (!strcmp(argument, "--help")) { return XSUM_usage_advanced(exename); }
         if (!strcmp(argument, "--version")) { XSUM_log(FULL_WELCOME_MESSAGE(exename)); XSUM_sanityCheck(); return 0; }
         if (!strcmp(argument, "--tag")) { convention = display_bsd; continue; }
+        if (!strcmp(argument, "--progress")) { PrintProgress = 1; continue; }
 
         if (!strcmp(argument, "--")) {
             if (filenamesStart==0 && i!=argc-1) filenamesStart=i+1; /* only supports a continuous list of filenames */
@@ -1133,6 +1208,6 @@ XSUM_API int XSUM_main(int argc, const char* argv[])
         return XSUM_checkFiles(argv+filenamesStart, argc-filenamesStart,
                           displayEndianess, strictMode, statusOnly, warn, (XSUM_logLevel < 2) /*quiet*/);
     } else {
-        return XSUM_hashFiles(argv+filenamesStart, argc-filenamesStart, algo, displayEndianess, convention);
+        return XSUM_hashFiles(argv+filenamesStart, argc-filenamesStart, algo, displayEndianess, convention, PrintProgress);
     }
 }
