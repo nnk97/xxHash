@@ -160,9 +160,13 @@ XSUM_hashStream(FILE* inFile,
 
     /* Load file & update hash */
     {   
-        size_t readSize;
-        clock_t clockStart;
         const char* units[] = { "B", "KB", "MB", "GB" };
+        
+        size_t    readSize;
+        clock_t   clockStart;
+        
+        char      printBuffer[256];
+        size_t    printClearLength = 0;
         
         int       fileSizePrintableUnit = 0;
         XSUM_U64  fileSizePrintableU64 = fileSize;
@@ -201,7 +205,7 @@ XSUM_hashStream(FILE* inFile,
             }
             const clock_t clockNow = clock();
             const clock_t clockDelta = clockNow - clockStart;
-            if (fileSize && clockDelta > CLOCKS_PER_SEC)
+            if (fileSize && clockDelta > (CLOCKS_PER_SEC / 4))
             {
                 const double TimeInSeconds = ((double)clockDelta) / CLOCKS_PER_SEC;
                 XSUM_U64 BytesDelta = processedBytes - prevProcessedBytes;
@@ -216,15 +220,49 @@ XSUM_hashStream(FILE* inFile,
                 XSUM_U64 BytesPerSecU64 = ((XSUM_U64)BytesPerSecond);
                 XSUM_U32 BytesPerSecU32 = 0;
                 int BytesPerSecUnit = XSUM_FormatByteCount(&BytesPerSecU64, &BytesPerSecU32);
+                BytesPerSecU32 = BytesPerSecU32 / 10;
                 
-                XSUM_log("\r # %lu.%u %s / %lu.%u %s  ( %lu.%u %s/s ) #", PrintProcessedBytes, PrintProcessedBytesDec, units[PrintProcessedBytesUnit],
-                                                                          fileSizePrintableU64, fileSizePrintableU32, units[fileSizePrintableUnit],
-                                                                          BytesPerSecU64, BytesPerSecU32, units[BytesPerSecUnit]);
+                XSUM_U64 RemainingBytesU64 = fileSize - processedBytes;
+                double RemainingTime = ((double)RemainingBytesU64) / BytesPerSecond;
+                XSUM_U32 RemainingBytesU32 = 0;
+                int RemainingBytesUnit = XSUM_FormatByteCount(&RemainingBytesU64, &RemainingBytesU32);
+                RemainingBytesU32 = RemainingBytesU32 / 100;
+                
+                char TimeUnit[] = { 's', 'm', 'h' };
+                int RemainingTimeUnit = 0;
+                
+                for (int i = 0; i < 3; i++)
+                {
+                    if (RemainingTime <= 60.f)
+                        break;
+                    RemainingTime /= 60.f;
+                    RemainingTimeUnit++;
+                }
+                
+                int OutLen = sprintf(printBuffer, "\r ### %lu.%u%s / %lu.%u%s (%lu.%u%s/s), %lu.%u%s left (%0.1f%c) ###", 
+                                     PrintProcessedBytes, PrintProcessedBytesDec, units[PrintProcessedBytesUnit],
+                                     fileSizePrintableU64, fileSizePrintableU32, units[fileSizePrintableUnit],
+                                     BytesPerSecU64, BytesPerSecU32, units[BytesPerSecUnit],
+                                     RemainingBytesU64, RemainingBytesU32, units[RemainingBytesUnit],
+                                     RemainingTime, TimeUnit[RemainingTimeUnit]);
+                XSUM_log("%s", printBuffer);
+                if (OutLen > printClearLength)
+                    printClearLength = OutLen;
             }
         }
         if (fileSize)
         {
-            XSUM_log("                                                                            \r"); // clear line again when we're done
+            struct timespec ts;
+            int res;
+            ts.tv_sec = 1;
+            ts.tv_nsec = 0;
+            memset(printBuffer, ' ', printClearLength);
+            printBuffer[printClearLength] = '\0';
+            XSUM_log("\r%s", printBuffer); // clear line again when we're done
+            do {
+                res = nanosleep(&ts, &ts);
+            } while (res && errno == EINTR);
+            XSUM_log("\r");
         }
         if (ferror(inFile)) {
             XSUM_log("Error: a failure occurred reading the input file.\n");
